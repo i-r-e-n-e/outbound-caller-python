@@ -1,0 +1,14 @@
+[34m
+* Datadog Agent 7 install script v1.39.0
+[0m
+[31mThis script does not support installing on the Mac.
+
+Please use the 1-step script available at https://app.datadoghq.com/account/settings/agent/latest?platform=macos.[0m
+curl: (6) Could not resolve host: instrumentation-telemetry-intake.US1
+curl: (6) Could not resolve host: instrumentation-telemetry-intake.US1
+curl: (6) Could not resolve host: instrumentation-telemetry-intake.US1
+curl: (6) Could not resolve host: instrumentation-telemetry-intake.US1
+curl: (6) Could not resolve host: instrumentation-telemetry-intake.US1
+curl: (6) Could not resolve host: instrumentation-telemetry-intake.US1
+Unable to send telemetry
+bash: line 394: 1753283648N: value too great for base (error token is "1753283648N")

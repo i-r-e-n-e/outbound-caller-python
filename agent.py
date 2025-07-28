@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from dotenv import load_dotenv
 import json
 import os
+import supabase
 from typing import Any
+from datetime import datetime
 
 from livekit import rtc, api
 from livekit.agents import (
@@ -18,23 +21,68 @@ from livekit.agents import (
     cli,
     WorkerOptions,
     RoomInputOptions,
+    llm,
+    # mcp,
 )
 from livekit.plugins import (
     deepgram,
     openai,
     cartesia,
+    elevenlabs,
     silero,
     noise_cancellation,  # noqa: F401
 )
 from livekit.plugins.turn_detector.english import EnglishModel
+from livekit.agents.telemetry import set_tracer_provider
 
+from ddtrace import patch_all, tracer
+from langfuse import Langfuse
+
+from mcp_client import MCPServerSse
+from mcp_client.agent_tools import MCPToolsIntegration
 
 # load environment variables, this is optional, only used for local development
-load_dotenv(dotenv_path=".env.local")
-logger = logging.getLogger("outbound-caller")
+load_dotenv(dotenv_path=".env.local", override=True)
+logger = logginggetLogger("outbound-caller")
 logger.setLevel(logging.INFO)
 
+# Langfuse
+_langfuse = Langfuse(
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    host=os.getenv("LANGFUSE_HOST"),
+)
+
+# datadog trace
+patch_all()
+
+
+print(f"SIP_OUTBOUND_TRUNK_ID: {repr(os.getenv('SIP_OUTBOUND_TRUNK_ID'))}")
+print("DEBUG: LANGFUSE_PUBLIC_KEY =", os.getenv("LANGFUSE_PUBLIC_KEY"))
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+
+# Tracing
+def setup_langfuse(
+    host: str | None = None, public_key: str | None = None, secret_key: str | None = None
+):
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    public_key = public_key or os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = secret_key or os.getenv("LANGFUSE_SECRET_KEY")
+    host = host or os.getenv("LANGFUSE_HOST")
+
+    if not public_key or not secret_key or not host:
+        raise ValueError("LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST must be set")
+
+    langfuse_auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+    os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"{host.rstrip('/')}/api/public/otel"
+    os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"Authorization=Basic {langfuse_auth}"
+
+    trace_provider = TracerProvider()
+    trace_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    set_tracer_provider(trace_provider)
 
 
 class OutboundCaller(Agent):
@@ -46,13 +94,30 @@ class OutboundCaller(Agent):
         dial_info: dict[str, Any],
     ):
         super().__init__(
-            instructions=f"""
-            You are a scheduling assistant for a dental practice. Your interface with user will be voice.
-            You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details.
-            As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation.
+            #scheduling assistant (original)
+            # instructions=f"""
+            # You are a scheduling assistant for a dental practice. Your interface with user will be voice.
+            # You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details.
+            # As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation.
 
-            When the user would like to be transferred to a human agent, first confirm with them. upon confirmation, use the transfer_call tool.
-            The customer's name is {name}. His appointment is on {appointment_time}.
+            # When the user would like to be transferred to a human agent, first confirm with them. upon confirmation, use the transfer_call tool.
+            # The customer's name is {name}. His appointment is on {appointment_time}.
+            # """
+
+            instructions = f"""
+            You are a virtual assistant calling on behalf of a customer who wants to know the operating hours of a business. Your interface with the user will be voice.
+            You are speaking to a store employee. Your goal is to politely and professionally ask: "What are your store's hours of operation?" and gather clear information about the opening and closing times for each day of the week, if possible.
+            Repeat the hours back to confirm understanding. If the user provides partial information (e.g., only today's hours), you may gently ask if they can share the full weekly schedule.
+            Maintain a calm, friendly tone. Do not rush the conversation. Allow the store representative to respond fully.
+            If at any point the representative asks to speak to a human, or if the information is unclear, confirm whether they’d like to be transferred. Upon confirmation, use the transfer_call tool.
+            Thank the representative at the end of the call and let them end the conversation if they wish.
+
+            You can retrieve data via the MCP server. The interface is voice-based: 
+            accept spoken user queries and respond with synthesized speech.
+
+            End the call completely with end_call at a reasonable endpoint. 
+            Some examples:
+            - The human speaker says bye and you have said bye and time it passing but the human speaker has not ended the call yet
             """
         )
         # keep reference to the participant for transfers
@@ -60,11 +125,23 @@ class OutboundCaller(Agent):
 
         self.dial_info = dial_info
 
+        self.current_trace = None
+
+        self.transcript: list[dict[str, str]] = []
+
+    # The voice will start speaking on entry (before if hears the user)
+    async def on_enter(self):
+        self.session.generate_reply()
+
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
 
     async def hangup(self):
         """Helper function to hang up the call by deleting the room"""
+
+        # Not running in a job context 
+        if ctx is None:
+            return
 
         job_ctx = get_job_context()
         await job_ctx.api.room.delete_room(
@@ -73,6 +150,7 @@ class OutboundCaller(Agent):
             )
         )
 
+    @tracer.wrap(name="transfer_call", service="outbound_calls")
     @function_tool()
     async def transfer_call(self, ctx: RunContext):
         """Transfer the call to a human agent, called after confirming with the user"""
@@ -84,9 +162,10 @@ class OutboundCaller(Agent):
         logger.info(f"transferring call to {transfer_to}")
 
         # let the message play fully before transferring
-        await ctx.session.generate_reply(
-            instructions="let the user know you'll be transferring them"
-        )
+        with tracer.trace("ctx.session.generate_reply") as my_span:
+            await ctx.session.generate_reply(
+                instructions="let the user know you'll be transferring them"
+            )
 
         job_ctx = get_job_context()
         try:
@@ -106,6 +185,17 @@ class OutboundCaller(Agent):
             )
             await self.hangup()
 
+    @tracer.wrap(name="voicemall_detected", service="outbound_calls")
+    @function_tool
+    async def detected_answering_machine(self):
+        """Call this tool if you have detected a voicemail system, AFTER hearing the voicemail greeting"""
+        await self.session.generate_reply(
+            instructions="Leave a voicemail message letting the user know you'll call back later."
+        )
+        await asyncio.sleep(0.5) # Add a natural gap to the end of the voicemail message
+        await hangup_call()
+
+    @tracer.wrap(name="end_call", service="outbound_calls")
     @function_tool()
     async def end_call(self, ctx: RunContext):
         """Called when the user wants to end the call"""
@@ -116,54 +206,86 @@ class OutboundCaller(Agent):
         if current_speech:
             await current_speech.wait_for_playout()
 
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # use service key if backend
+        client = supabase.create_client(supabase_url, supabase_key)
+
+        # Serialize transcript into a single string or structured format
+        transcript_text = "\n".join(f"{line['speaker']}: {line['text']}" for line in self.transcript)
+
+        # Assuming your Supabase table is called "voice agent"
+        client.table("voice agent").update({
+        "transcript": transcript_text,
+        "dateLastCalled": datetime.utcnow().isoformat()
+        }).eq("phoneNumber", self.dial_info["phone_number"]).execute()
+
         await self.hangup()
 
-    @function_tool()
-    async def look_up_availability(
-        self,
-        ctx: RunContext,
-        date: str,
-    ):
-        """Called when the user asks about alternative appointment availability
+    # @tracer.wrap(name="love_up_availability", service="outbound_calls")
+    # @function_tool()
+    # async def look_up_availability(
+    #     self,
+    #     ctx: RunContext,
+    #     date: str,
+    # ):
+    #     """Called when the user asks about alternative appointment availability
 
-        Args:
-            date: The date of the appointment to check availability for
-        """
-        logger.info(
-            f"looking up availability for {self.participant.identity} on {date}"
-        )
-        await asyncio.sleep(3)
-        return {
-            "available_times": ["1pm", "2pm", "3pm"],
-        }
+    #     Args:
+    #         date: The date of the appointment to check availability for
+    #     """
+    #     logger.info(
+    #         f"looking up availability for {self.participant.identity} on {date}"
+    #     )
+    #     await asyncio.sleep(3)
+    #     return {
+    #         "available_times": ["1pm", "2pm", "3pm"],
+    #     }
 
-    @function_tool()
-    async def confirm_appointment(
-        self,
-        ctx: RunContext,
-        date: str,
-        time: str,
-    ):
-        """Called when the user confirms their appointment on a specific date.
-        Use this tool only when they are certain about the date and time.
+    # @tracer.wrap(name="confirm_appointment", service="outbound_calls")
+    # @function_tool()
+    # async def confirm_appointment(
+    #     self,
+    #     ctx: RunContext,
+    #     date: str,
+    #     time: str,
+    # ):
+    #     """Called when the user confirms their appointment on a specific date.
+    #     Use this tool only when they are certain about the date and time.
 
-        Args:
-            date: The date of the appointment
-            time: The time of the appointment
-        """
-        logger.info(
-            f"confirming appointment for {self.participant.identity} on {date} at {time}"
-        )
-        return "reservation confirmed"
+    #     Args:
+    #         date: The date of the appointment
+    #         time: The time of the appointment
+    #     """
+    #     logger.info(
+    #         f"confirming appointment for {self.participant.identity} on {date} at {time}"
+    #     )
+    #     return "reservation confirmed"
 
+    @tracer.wrap(name="detected_answering_machine", service="outbound_calls")
     @function_tool()
     async def detected_answering_machine(self, ctx: RunContext):
         """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
         logger.info(f"detected answering machine for {self.participant.identity}")
         await self.hangup()
 
+    @tracer.wrap(name="on_user_turn_completed", service="outbound_calls")
+    async def on_user_turn_completed(self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage):
+        user_transcript = new_message.text_content
+        logger.info(f"[User]: {user_transcript}")
+        self.transcript.append({"speaker": "user", "text": user_transcript})
 
+    @tracer.wrap(name="on_agent_turn_completed", service="outbound_calls")
+    async def on_agent_turn_completed(self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage):
+        agent_reply = new_message.text_content
+        logger.info(f"[Agent]: {agent_reply}")
+        self.transcript.append({"speaker": "agent", "text": agent_reply})
+
+
+@tracer.wrap(name="entrypoint", service="outbound_calls")
 async def entrypoint(ctx: JobContext):
+    # set up the langfuse tracer 
+    setup_langfuse()
+
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect()
 
@@ -172,6 +294,7 @@ async def entrypoint(ctx: JobContext):
     # - phone_number: the phone number to dial
     # - transfer_to: the phone number to transfer the call to when requested
     dial_info = json.loads(ctx.job.metadata)
+
     participant_identity = phone_number = dial_info["phone_number"]
 
     # look up the user's phone number and appointment details
@@ -185,12 +308,44 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(
         turn_detection=EnglishModel(),
         vad=silero.VAD.load(),
-        stt=deepgram.STT(),
-        # you can also use OpenAI's TTS with openai.TTS()
-        tts=cartesia.TTS(),
+        stt=deepgram.STT(
+            model="nova-2-general",
+            language="en" #zh-TW is traditional chinese
+        ),
+   
+        tts=elevenlabs.TTS(
+            voice_id="EXAVITQu4vr4xnSDxMaL",
+            model="eleven_multilingual_v2"
+        ),
         llm=openai.LLM(model="gpt-4o"),
-        # you can also use a speech-to-speech model like OpenAI's Realtime API
-        # llm=openai.realtime.RealtimeModel()
+
+        # For transcriptions 
+        use_tts_aligned_transcript=True,
+
+        # MCP
+        # mcp_servers=[
+        #     mcp.MCPServerHTTP(
+        #         url=os.environ.get("ZAPIER_MCP_URL"),
+        #         timeout=10,
+        #         client_session_timeout_seconds=10,
+        #     ),
+        #     mcp.MCPServerHTTP(
+        #         url="http://localhost:8000/sse",
+        #         timeout=5,
+        #         client_session_timeout_seconds=5,
+        #     ),
+        # ],
+
+        mcp_server = MCPServerSse(
+        params={"url": os.environ.get("ZAPIER_MCP_URL")},
+        cache_tools_list=True,
+        name="SSE MCP Server"
+        )
+
+        agent = await MCPToolsIntegration.create_agent_with_tools(
+            agent_class=OutboundCaller,
+            mcp_servers=[mcp_server]
+        )
     )
 
     # start the session first before dialing, to ensure that when the user picks up
@@ -208,6 +363,10 @@ async def entrypoint(ctx: JobContext):
 
     # `create_sip_participant` starts dialing the user
     try:
+        if not outbound_trunk_id:
+            logger.error("SIP_OUTBOUND_TRUNK_ID is not set. Please check your .env.local or environment.")
+            raise ValueError("Missing required SIP trunk ID.")
+
         await ctx.api.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
                 room_name=ctx.room.name,
