@@ -43,7 +43,7 @@ from mcp_client.agent_tools import MCPToolsIntegration
 
 # load environment variables, this is optional, only used for local development
 load_dotenv(dotenv_path=".env.local", override=True)
-logger = logginggetLogger("outbound-caller")
+logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.INFO)
 
 # Langfuse
@@ -94,16 +94,6 @@ class OutboundCaller(Agent):
         dial_info: dict[str, Any],
     ):
         super().__init__(
-            #scheduling assistant (original)
-            # instructions=f"""
-            # You are a scheduling assistant for a dental practice. Your interface with user will be voice.
-            # You will be on a call with a patient who has an upcoming appointment. Your goal is to confirm the appointment details.
-            # As a customer service representative, you will be polite and professional at all times. Allow user to end the conversation.
-
-            # When the user would like to be transferred to a human agent, first confirm with them. upon confirmation, use the transfer_call tool.
-            # The customer's name is {name}. His appointment is on {appointment_time}.
-            # """
-
             instructions = f"""
             You are a virtual assistant calling on behalf of a customer who wants to know the operating hours of a business. Your interface with the user will be voice.
             You are speaking to a store employee. Your goal is to politely and professionally ask: "What are your store's hours of operation?" and gather clear information about the opening and closing times for each day of the week, if possible.
@@ -221,46 +211,7 @@ class OutboundCaller(Agent):
 
         await self.hangup()
 
-    # @tracer.wrap(name="love_up_availability", service="outbound_calls")
-    # @function_tool()
-    # async def look_up_availability(
-    #     self,
-    #     ctx: RunContext,
-    #     date: str,
-    # ):
-    #     """Called when the user asks about alternative appointment availability
-
-    #     Args:
-    #         date: The date of the appointment to check availability for
-    #     """
-    #     logger.info(
-    #         f"looking up availability for {self.participant.identity} on {date}"
-    #     )
-    #     await asyncio.sleep(3)
-    #     return {
-    #         "available_times": ["1pm", "2pm", "3pm"],
-    #     }
-
-    # @tracer.wrap(name="confirm_appointment", service="outbound_calls")
-    # @function_tool()
-    # async def confirm_appointment(
-    #     self,
-    #     ctx: RunContext,
-    #     date: str,
-    #     time: str,
-    # ):
-    #     """Called when the user confirms their appointment on a specific date.
-    #     Use this tool only when they are certain about the date and time.
-
-    #     Args:
-    #         date: The date of the appointment
-    #         time: The time of the appointment
-    #     """
-    #     logger.info(
-    #         f"confirming appointment for {self.participant.identity} on {date} at {time}"
-    #     )
-    #     return "reservation confirmed"
-
+  
     @tracer.wrap(name="detected_answering_machine", service="outbound_calls")
     @function_tool()
     async def detected_answering_machine(self, ctx: RunContext):
@@ -294,18 +245,30 @@ async def entrypoint(ctx: JobContext):
     # - phone_number: the phone number to dial
     # - transfer_to: the phone number to transfer the call to when requested
     dial_info = json.loads(ctx.job.metadata)
-
     participant_identity = phone_number = dial_info["phone_number"]
 
-    # look up the user's phone number and appointment details
-    agent = OutboundCaller(
-        name="Jayden",
-        appointment_time="next Tuesday at 3pm",
-        dial_info=dial_info,
-    )
+    # Create an MCP server
+    mcp_server = MCPServerSse(
+        params={"url": os.environ.get("ZAPIER_MCP_URL")},
+        cache_tools_list=True,
+        name="SSE MCP Server"
+        )
+
+    # Create an agent with MCP tools
+    agent = await MCPToolsIntegration.create_agent_with_tools(
+            agent_class=OutboundCaller,
+            agent_kwargs={
+                "name": "Jayden",
+                "appointment_time": "next Tuesday at 3pm",
+                "dial_info": dial_info,
+            },
+            mcp_servers=[mcp_server]
+        )
 
     # the following uses GPT-4o, Deepgram and Cartesia
     session = AgentSession(
+        agent=agent,
+        room=ctx.room,
         turn_detection=EnglishModel(),
         vad=silero.VAD.load(),
         stt=deepgram.STT(
@@ -322,30 +285,10 @@ async def entrypoint(ctx: JobContext):
         # For transcriptions 
         use_tts_aligned_transcript=True,
 
-        # MCP
-        # mcp_servers=[
-        #     mcp.MCPServerHTTP(
-        #         url=os.environ.get("ZAPIER_MCP_URL"),
-        #         timeout=10,
-        #         client_session_timeout_seconds=10,
-        #     ),
-        #     mcp.MCPServerHTTP(
-        #         url="http://localhost:8000/sse",
-        #         timeout=5,
-        #         client_session_timeout_seconds=5,
-        #     ),
-        # ],
 
-        mcp_server = MCPServerSse(
-        params={"url": os.environ.get("ZAPIER_MCP_URL")},
-        cache_tools_list=True,
-        name="SSE MCP Server"
-        )
+        
 
-        agent = await MCPToolsIntegration.create_agent_with_tools(
-            agent_class=OutboundCaller,
-            mcp_servers=[mcp_server]
-        )
+        
     )
 
     # start the session first before dialing, to ensure that when the user picks up
