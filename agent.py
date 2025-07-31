@@ -7,7 +7,9 @@ from dotenv import load_dotenv
 import json
 import os
 import supabase
-from typing import Any
+import requests
+from typing import Any #Annotated
+# from pydantic import Field
 from datetime import datetime
 
 from livekit import rtc, api
@@ -22,7 +24,8 @@ from livekit.agents import (
     WorkerOptions,
     RoomInputOptions,
     llm,
-    # mcp,
+    ChatContext, 
+    ChatMessage
 )
 from livekit.plugins import (
     deepgram,
@@ -34,9 +37,12 @@ from livekit.plugins import (
 )
 from livekit.plugins.turn_detector.english import EnglishModel
 from livekit.agents.telemetry import set_tracer_provider
+from livekit.plugins.elevenlabs.tts import VoiceSettings
+
 
 from ddtrace import patch_all, tracer
-from langfuse import Langfuse
+from langfuse import Langfuse, observe
+# from langfuse.decorators import observe
 
 from mcp_client import MCPServerSse
 from mcp_client.agent_tools import MCPToolsIntegration
@@ -56,9 +62,6 @@ _langfuse = Langfuse(
 # datadog trace
 patch_all()
 
-
-print(f"SIP_OUTBOUND_TRUNK_ID: {repr(os.getenv('SIP_OUTBOUND_TRUNK_ID'))}")
-print("DEBUG: LANGFUSE_PUBLIC_KEY =", os.getenv("LANGFUSE_PUBLIC_KEY"))
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
 
 # Tracing
@@ -95,7 +98,7 @@ class OutboundCaller(Agent):
     ):
         super().__init__(
             instructions = f"""
-            You are a virtual assistant calling on behalf of a customer who wants to know the operating hours of a business. Your interface with the user will be voice.
+            You are a virtual assistant calling on behalf of a customer who wants to know the operating hours of a business. First ask what their business is called. Your interface with the user will be voice.
             You are speaking to a store employee. Your goal is to politely and professionally ask: "What are your store's hours of operation?" and gather clear information about the opening and closing times for each day of the week, if possible.
             Repeat the hours back to confirm understanding. If the user provides partial information (e.g., only today's hours), you may gently ask if they can share the full weekly schedule.
             Maintain a calm, friendly tone. Do not rush the conversation. Allow the store representative to respond fully.
@@ -119,7 +122,16 @@ class OutboundCaller(Agent):
 
         self.transcript: list[dict[str, str]] = []
 
-    # The voice will start speaking on entry (before if hears the user)
+        # Testing N8N webhook 
+        # payload = {
+        #     "restaurant_name": "Ten Thousand Coffee"
+        # }
+
+        # requests.post(os.environ.get("N8N_WEBHOOK_URL"), json=payload)
+
+
+
+    # The voice will start speaking on entry (before the user starts speaking)
     async def on_enter(self):
         self.session.generate_reply()
 
@@ -140,6 +152,45 @@ class OutboundCaller(Agent):
             )
         )
 
+    # Send info to zapier which will then create an email (MCP)
+    @observe(as_type="generation")
+    @tracer.wrap(name="email_hours", service="outbound_calls")
+    @function_tool()
+    async def email_hours(self, name: str, hours: str, ctx: RunContext):
+        """Use this tool when the store representative has provided the hours of operation and their business's name.
+            You will extract and organize the hours in the following format:
+            e.g.
+            {
+                "name": "Restaurant Name",
+                "hours": {
+                    "Monday": "9:00 AM - 5:00 PM",
+                    "Tuesday": "9:00 AM - 5:00 PM",
+                    "Wednesday": "9:00 AM - 5:00 PM",
+                    "Thursday": "9:00 AM - 5:00 PM",
+                    "Friday": "9:00 AM - 5:00 PM",
+                    "Saturday": "10:00 AM - 4:00 PM",
+                    "Sunday": "Closed"
+                }
+            }
+
+        If the representative only gives partial information, include what they provide and leave out missing days and fill in as N/A.
+        Always double-check and repeat back the hours to confirm accuracy before submitting.
+        """
+
+        logger.info(f"Hours and name received from : {{name}}")
+
+        # Create payload for data being sent in post request 
+        payload = {
+            "name": name, 
+            "hours:": hours
+        }
+
+        # Make a post to Zapier with the name and hours of business
+        requests.post(os.environ.get("N8N_WEBHOOK_URL"), json=payload)
+
+
+
+    @observe(as_type="generation")
     @tracer.wrap(name="transfer_call", service="outbound_calls")
     @function_tool()
     async def transfer_call(self, ctx: RunContext):
@@ -175,6 +226,8 @@ class OutboundCaller(Agent):
             )
             await self.hangup()
 
+    # The voice agent will end the call when answering machine is detected (hasn't been tested)
+    @observe(as_type="generation")
     @tracer.wrap(name="voicemall_detected", service="outbound_calls")
     @function_tool
     async def detected_answering_machine(self):
@@ -183,8 +236,10 @@ class OutboundCaller(Agent):
             instructions="Leave a voicemail message letting the user know you'll call back later."
         )
         await asyncio.sleep(0.5) # Add a natural gap to the end of the voicemail message
-        await hangup_call()
+        await self.hangup()
 
+    # End the call (doesn't work)
+    @observe(as_type="generation")
     @tracer.wrap(name="end_call", service="outbound_calls")
     @function_tool()
     async def end_call(self, ctx: RunContext):
@@ -211,30 +266,26 @@ class OutboundCaller(Agent):
 
         await self.hangup()
 
-  
-    @tracer.wrap(name="detected_answering_machine", service="outbound_calls")
-    @function_tool()
-    async def detected_answering_machine(self, ctx: RunContext):
-        """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
-        logger.info(f"detected answering machine for {self.participant.identity}")
-        await self.hangup()
-
+    # For transcript - human speaker (hasn't been tested)
+    @observe(as_type="generation")
     @tracer.wrap(name="on_user_turn_completed", service="outbound_calls")
     async def on_user_turn_completed(self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage):
         user_transcript = new_message.text_content
         logger.info(f"[User]: {user_transcript}")
         self.transcript.append({"speaker": "user", "text": user_transcript})
 
+    # For transcript - voice agent (hasn't been tested)
+    @observe(as_type="generation")
     @tracer.wrap(name="on_agent_turn_completed", service="outbound_calls")
     async def on_agent_turn_completed(self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage):
         agent_reply = new_message.text_content
         logger.info(f"[Agent]: {agent_reply}")
         self.transcript.append({"speaker": "agent", "text": agent_reply})
 
-
+@observe(as_type="generation")
 @tracer.wrap(name="entrypoint", service="outbound_calls")
 async def entrypoint(ctx: JobContext):
-    # set up the langfuse tracer 
+    # Set up the langfuse tracer 
     setup_langfuse()
 
     logger.info(f"connecting to room {ctx.room.name}")
@@ -247,28 +298,33 @@ async def entrypoint(ctx: JobContext):
     dial_info = json.loads(ctx.job.metadata)
     participant_identity = phone_number = dial_info["phone_number"]
 
-    # Create an MCP server
-    mcp_server = MCPServerSse(
-        params={"url": os.environ.get("ZAPIER_MCP_URL")},
-        cache_tools_list=True,
-        name="SSE MCP Server"
-        )
+    # Create an MCP server - so livekit can use tools (e.g. GCal, Gmail)
+    # print("Triggering URL:", os.environ.get("N8N_MCP_URL"))
 
-    # Create an agent with MCP tools
-    agent = await MCPToolsIntegration.create_agent_with_tools(
-            agent_class=OutboundCaller,
-            agent_kwargs={
-                "name": "Jayden",
-                "appointment_time": "next Tuesday at 3pm",
-                "dial_info": dial_info,
-            },
-            mcp_servers=[mcp_server]
-        )
+    # mcp_server = MCPServerSse(
+    #     params={"url": os.environ.get("N8N_MCP_URL")},
+    #     cache_tools_list=True,
+    #     name="SSE MCP Server"
+    #     )
 
-    # the following uses GPT-4o, Deepgram and Cartesia
+    # # Create an agent with MCP tools
+    # agent = await MCPToolsIntegration.create_agent_with_tools(
+    #         agent_class=OutboundCaller,
+    #         agent_kwargs={
+    #             "name": "Jayden",
+    #             "appointment_time": "next Tuesday at 3pm",
+    #             "dial_info": dial_info,
+    #         },
+    #         mcp_servers=[mcp_server]
+    #     )
+
+    agent = OutboundCaller(
+        name="Jayden",
+        appointment_time="next Tuesday at 3pm",
+        dial_info=dial_info,
+    )    
+
     session = AgentSession(
-        agent=agent,
-        room=ctx.room,
         turn_detection=EnglishModel(),
         vad=silero.VAD.load(),
         stt=deepgram.STT(
@@ -278,17 +334,17 @@ async def entrypoint(ctx: JobContext):
    
         tts=elevenlabs.TTS(
             voice_id="EXAVITQu4vr4xnSDxMaL",
-            model="eleven_multilingual_v2"
+            model="eleven_multilingual_v2",
+            voice_settings=VoiceSettings(
+                speed=0.8,
+                stability=1,
+                similarity_boost=1,
+            ),
         ),
         llm=openai.LLM(model="gpt-4o"),
 
         # For transcriptions 
-        use_tts_aligned_transcript=True,
-
-
-        
-
-        
+        use_tts_aligned_transcript=True,      
     )
 
     # start the session first before dialing, to ensure that when the user picks up
@@ -310,6 +366,7 @@ async def entrypoint(ctx: JobContext):
             logger.error("SIP_OUTBOUND_TRUNK_ID is not set. Please check your .env.local or environment.")
             raise ValueError("Missing required SIP trunk ID.")
 
+
         await ctx.api.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
                 room_name=ctx.room.name,
@@ -317,7 +374,7 @@ async def entrypoint(ctx: JobContext):
                 sip_call_to=phone_number,
                 participant_identity=participant_identity,
                 # function blocks until user answers the call, or if the call fails
-                wait_until_answered=True,
+                # wait_until_answered=True,
             )
         )
 

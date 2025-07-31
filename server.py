@@ -49,7 +49,7 @@ def call_store():
         "--url", os.environ["LIVEKIT_URL"]
     ]
 
-    print("Running command")
+    print("Running command", command)
 
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
