@@ -65,7 +65,7 @@ RunContext_T = RunContext[UserData]
 # load environment variables, this is optional, only used for local development
 load_dotenv(dotenv_path=".env.local", override=True)
 
-# Log - printing out statements in terminal
+# Log - printing out statements in terminal (for debugging)
 logging.basicConfig(
     level=logging.INFO,  # 👈 this is key — must be INFO or lower
     format="[%(levelname)s] %(asctime)s - %(name)s - %(message)s",
@@ -81,12 +81,7 @@ if not logger.hasHandlers():
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-# Langfuse
-_langfuse = Langfuse(
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-    host=os.getenv("LANGFUSE_HOST"),
-)
+
 
 # datadog trace
 patch_all()
@@ -98,6 +93,12 @@ url: str = os.environ.get("SUPABASE_URL")
 key: str = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(url, key)
 
+# Langfuse - tracing
+_langfuse = Langfuse(
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    host=os.getenv("LANGFUSE_HOST"),
+)
 
 # Tracing
 def setup_langfuse(
@@ -158,8 +159,9 @@ class OutboundCaller(Agent):
 
 
     # The voice will start speaking on entry (before the user starts speaking)
-    # async def on_enter(self):
-    #     self.session.generate_reply()
+    async def on_enter(self):
+        logger.info("Agent session has started")
+        # self.session.generate_reply()
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
@@ -253,13 +255,11 @@ class OutboundCaller(Agent):
     async def send_dtmf_code(
         self,
         code: Annotated[int, Field(description="The DTMF code to send to the phone number for the current step.")],
-        context: RunContext_T
+        ctx: RunContext_T
     ) -> None:
         """
         You have encountered an IVR (Interactive Voice Response) system.
-
         Your goal is to reach customer support or a human representative. To do this, listen carefully to the IVR menu options, and select the one that will most likely connect you to a live agent or support team.
-
         This function is called when it’s time to send a DTMF code (a digit like 1, 2, 3, etc.) to select an option from the current phone menu.
 
         Based on the most recent IVR prompt you heard, choose the most appropriate DTMF digit to press. The options may include things like:
@@ -268,7 +268,6 @@ class OutboundCaller(Agent):
         - "Press 3 to speak to a representative"
 
         You should **prioritize options that lead to technical support, customer service, live agents, or human representatives**.
-
         If the IVR repeats or is unclear, wait for more information before sending a digit.
 
         Example behaviors:
@@ -277,7 +276,6 @@ class OutboundCaller(Agent):
         - Avoid options like store hours, location, or marketing unless they’re the only way to reach a human.
 
         Do not guess. Base your decision solely on the IVR prompt.
-
         Only call this function once you’re confident about the correct digit to send.
         Do not respond to any prompts, questions, or menu options. Remain silent after saying the sentence. This instruction must be followed without exception.
         """
@@ -288,15 +286,20 @@ class OutboundCaller(Agent):
         logger.info("IVR navigation entered")
         
         # Check if enough time has passed since last press (3 second cooldown)
-        if current_time - context.userdata.last_dtmf_press < 3:
+        if current_time - ctx.userdata.last_dtmf_press < 3:
             logger.info("DTMF code rejected due to cooldown")
             return None
             
         logger.info(f"Sending DTMF code {code} to the phone number for the current step.")
-        context.userdata.last_dtmf_press = current_time
-        
-        room = context.session.room
+        ctx.userdata.last_dtmf_press = current_time
 
+        # For debugging
+        # logger.info(f"ctx: {ctx}")
+        # logger.info(f"ctx.session: {ctx.session}")
+        # logger.info(f"ctx.session.room: {getattr(ctx.session, 'room', None)}")
+
+        room = ctx.session.room
+        
         await room.local_participant.publish_dtmf(
             code=code,
             digit=str(code)
@@ -398,7 +401,8 @@ async def entrypoint(ctx: JobContext):
     # - phone_number: the phone number to dial
     # - transfer_to: the phone number to transfer the call to when requested
     dial_info = json.loads(ctx.job.metadata)
-    participant_identity = phone_number = dial_info["phone_number"]
+    phone_number = dial_info["phone_number"]
+    participant_identity = phone_number 
 
     # Create an MCP server - so livekit can use tools (e.g. GCal, Gmail)
     # print("Triggering URL:", os.environ.get("N8N_MCP_URL"))
@@ -479,6 +483,9 @@ async def entrypoint(ctx: JobContext):
         )
     )
 
+    logger.info("testing session.room")
+    session.room = ctx.room
+
     # `create_sip_participant` starts dialing the user
     try:
         if not outbound_trunk_id:
@@ -502,9 +509,7 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"participant joined: {participant.identity}")
 
         task = participant._info.attributes.get("task", "reach support via IVR")
-
         agent.set_participant(participant)
-
         session.userdata = UserData(task=task)
 
 
