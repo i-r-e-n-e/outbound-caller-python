@@ -167,24 +167,27 @@ class OutboundCaller(Agent):
         self.participant = participant
 
     async def hangup(self):
-        lkapi = api.LiveKitAPI()
+        logger.info("hangup function")
+        # lkapi = api.LiveKitAPI()
         job_ctx = get_job_context()
 
         # Not running in a job context 
         if job_ctx is None:
             return
 
-        # Deletes room, however call is not terminated
+        # Deletes room and terminates call
         await job_ctx.api.room.delete_room(
             api.DeleteRoomRequest(
                 room=job_ctx.room.name,
             )
         )
+
+        logger.info("testing if the call still exists")
         
-        # Terminates the call fully
-        await lkapi.room.delete_room(DeleteRoomRequest(
-            room=job_ctx.room,
-        ))
+        # Same as the function above
+        # await lkapi.room.delete_room(DeleteRoomRequest(
+        #     room=job_ctx.room.name,
+        # ))
 
      
     # Send info to zapier which will then create an email (MCP)
@@ -331,12 +334,13 @@ class OutboundCaller(Agent):
             )
             await self.hangup()
 
-    # The voice agent will end the call when answering machine is detected (hasn't been tested)
+    # The voice agent will end the call when answering machine is detected
     @observe(as_type="generation")
     @tracer.wrap(name="voicemall_detected", service="outbound_calls")
     @function_tool
     async def detected_answering_machine(self):
         """Call this tool if you have detected a voicemail system, AFTER hearing the voicemail greeting"""
+        logger.info("detected answering machine function called")
         await self.session.generate_reply(
             instructions="Leave a voicemail message letting the user know you'll call back later."
         )
@@ -348,7 +352,8 @@ class OutboundCaller(Agent):
     @tracer.wrap(name="end_call", service="outbound_calls")
     @function_tool()
     async def end_call(self, ctx: RunContext_T):
-        """Called when the user wants to end the call"""
+        """Called when the user wants to end the call, or after you have gathered all of the necessary details (hours, business name)
+        or if it seems like the call is ending and there has been silence for a while """
         logger.info(f"ending the call for {self.participant.identity}")
 
         #let the agent finish speaking
@@ -363,7 +368,7 @@ class OutboundCaller(Agent):
         except Exception as e:
             logger.exception(f"Error while waiting for playout: {e}")
 
-        logger.info("testing the end call funciton")
+        logger.info("testing the end call function")
         await self.hangup()
 
 
@@ -446,8 +451,9 @@ async def entrypoint(ctx: JobContext):
         # For transcriptions 
         use_tts_aligned_transcript=True,  
 
-        # For IVR (if ivr starts then the voice agent should listen)
-        allow_interruptions = True,    
+        # For IVR (seconds of silence before the human user is considered to be done speaking)
+        # allow_interruptions = True,    
+        min_endpointing_delay=0.75
     )
 
     # start the session first before dialing, to ensure that when the user picks up
