@@ -161,45 +161,32 @@ class OutboundCaller(Agent):
     # The voice will start speaking on entry (before the user starts speaking)
     async def on_enter(self):
         logger.info("Agent session has started")
-        # self.session.generate_reply()
+        self.session.generate_reply()
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
 
     async def hangup(self):
-        """
-        Helper function to hang up the call by deleting the room, call this function when it seems
-        like the call is ending. When you are at this tool, make sure to say this phrase, "Hope you 
-        have a very nice day, love the weather today" verbatum.
-        """
         lkapi = api.LiveKitAPI()
         job_ctx = get_job_context()
 
         # Not running in a job context 
-        if ctx is None:
+        if job_ctx is None:
             return
- 
+
+        # Deletes room, however call is not terminated
         await job_ctx.api.room.delete_room(
             api.DeleteRoomRequest(
                 room=job_ctx.room.name,
             )
         )
-
+        
+        # Terminates the call fully
         await lkapi.room.delete_room(DeleteRoomRequest(
             room=job_ctx.room,
         ))
 
-        logger.info("Testing deleting room")
-
-        await lkapi.room.remove_participant(RoomParticipantIdentity(
-            room=job_ctx.room,
-            identity=self.participant.identity,
-        ))
-
-        logger.info("testing removing participant")
-
      
-
     # Send info to zapier which will then create an email (MCP)
     @observe(as_type="generation")
     @tracer.wrap(name="store_hours", service="outbound_calls")
@@ -245,8 +232,6 @@ class OutboundCaller(Agent):
             # .eq("phone_number", "14088936898")
             .execute()
         )
-
-        await self.hangup()
 
     # For navigating IVR 
     @observe(as_type="generation")
@@ -358,7 +343,7 @@ class OutboundCaller(Agent):
         await asyncio.sleep(0.5) # Add a natural gap to the end of the voicemail message
         await self.hangup()
 
-    # End the call (doesn't work)
+    # End the call
     @observe(as_type="generation")
     @tracer.wrap(name="end_call", service="outbound_calls")
     @function_tool()
@@ -366,24 +351,19 @@ class OutboundCaller(Agent):
         """Called when the user wants to end the call"""
         logger.info(f"ending the call for {self.participant.identity}")
 
-        # let the agent finish speaking
-        # try:
-        #     current_speech = ctx.session.current_speech
-        #     if current_speech:
-        #         logger.info("waiting for speech to finish...")
-        #         await asyncio.wait_for(current_speech.wait_for_playout(), timeout=5)
-        #         logger.info("done waiting for speech")
-        #     else:
-        #         logger.info("no current speech found")
-        # except Exception as e:
-        #     logger.exception(f"Error while waiting for playout: {e}")
+        #let the agent finish speaking
+        try:
+            current_speech = ctx.session.current_speech
+            if current_speech:
+                logger.info("waiting for speech to finish...")
+                await asyncio.wait_for(current_speech.wait_for_playout(), timeout=5)
+                logger.info("done waiting for speech")
+            else:
+                logger.info("no current speech found")
+        except Exception as e:
+            logger.exception(f"Error while waiting for playout: {e}")
 
-        # supabase_url = os.getenv("SUPABASE_URL")
-        # supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # use service key if backend
-        # client = supabase.create_client(supabase_url, supabase_key)
         logger.info("testing the end call funciton")
-
-
         await self.hangup()
 
 
