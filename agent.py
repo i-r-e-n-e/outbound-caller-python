@@ -217,12 +217,6 @@ class OutboundCaller(Agent):
 
         logger.info(f"Hours and name received from : {{name}}")
 
-        # Create payload for data being sent in post request 
-        # payload = {
-        #     "name": name, 
-        #     "hours": hours
-        # }
-
         # Make a post to Zapier with the name and hours of business
         # requests.post(os.environ.get("N8N_WEBHOOK_URL"), json=payload)
         logger.info("The dial info", self.dial_info)
@@ -231,8 +225,7 @@ class OutboundCaller(Agent):
         response = (
             supabase.table("voice_agent")
             .update({"result": hours})
-            .eq("phone_number", self.dial_info["phone_number"].lstrip("+")) # stored in supabase w/o '+' and in dial_info w/ '+'
-            # .eq("phone_number", "14088936898")
+            .eq("phone_number", self.dial_info["phone_number"].lstrip("+")) 
             .execute()
         )
 
@@ -280,11 +273,6 @@ class OutboundCaller(Agent):
             
         logger.info(f"Sending DTMF code {code} to the phone number for the current step.")
         ctx.userdata.last_dtmf_press = current_time
-
-        # For debugging
-        # logger.info(f"ctx: {ctx}")
-        # logger.info(f"ctx.session: {ctx.session}")
-        # logger.info(f"ctx.session.room: {getattr(ctx.session, 'room', None)}")
 
         room = ctx.session.room
         
